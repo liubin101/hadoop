@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
 
+import static org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CSQueueUtils.EPSILON;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -1027,6 +1028,41 @@ public class TestParentQueue {
         QUEUE_A_RESOURCE_30PERC);
     assertEquals(b.getQueueResourceQuotas().getEffectiveMinResource(),
         QUEUE_B_RESOURCE_70PERC);
+  }
+
+  @Test
+  public void testMaxApplicationsForAbsoluteResource()
+          throws Exception {
+    // Setup queue configs
+    setupSingleLevelQueuesWithAbsoluteResource(csConf);
+    csConf.setGlobalMaximumApplicationsPerQueue(100);
+
+    CSQueueStore queues = new CSQueueStore();
+    CSQueue root = CapacitySchedulerQueueManager.parseQueue(csContext, csConf,
+            null, CapacitySchedulerConfiguration.ROOT, queues, queues,
+            TestUtils.spyHook);
+
+    // Setup some nodes
+    final int memoryPerNode = 10;
+    int coresPerNode = 16;
+    int numNodes = 2;
+
+    Resource clusterResource = Resources.createResource(
+            numNodes * (memoryPerNode * GB), numNodes * coresPerNode);
+    when(csContext.getNumClusterNodes()).thenReturn(numNodes);
+    root.updateClusterResource(clusterResource,
+            new ResourceLimits(clusterResource));
+
+    // Start testing
+    LeafQueue a = (LeafQueue) queues.get(A);
+    LeafQueue b = (LeafQueue) queues.get(B);
+
+    assertEquals(0.3, a.getQueueCapacities().getAbsoluteCapacity(),
+            EPSILON);
+    assertEquals(0.7, b.getQueueCapacities().getAbsoluteCapacity(),
+            EPSILON);
+    assertEquals(100, a.getMaxApplications());
+    assertEquals(100, b.getMaxApplications());
   }
 
   @After
