@@ -302,6 +302,25 @@ public class CapacitySchedulerConfiguration extends ReservationSchedulerConfigur
   public static final boolean DEFAULT_SCHEDULE_ASYNCHRONOUSLY_ENABLE = true;
 
   @Private
+  public static final String INITIALIZE_QUEUES_PARALLEL_PREFIX =
+      PREFIX + "initialize-queues-parallel";
+
+  @Private
+  public static final String INITIALIZE_QUEUES_PARALLEL_ENABLE =
+      INITIALIZE_QUEUES_PARALLEL_PREFIX + ".enable";
+
+  @Private
+  public static final boolean DEFAULT_INITIALIZE_QUEUES_PARALLEL_ENABLE = false;
+
+  @Private
+  public static final String INITIALIZE_QUEUES_PARALLEL_MAXIMUM_THREAD =
+      INITIALIZE_QUEUES_PARALLEL_PREFIX + ".maximum-threads";
+
+  @Private
+  public static final Integer
+      DEFAULT_INITIALIZE_QUEUES_PARALLEL_MAXIMUM_THREAD = 1;
+
+  @Private
   public static final String QUEUE_MAPPING = PREFIX + "queue-mappings";
 
   @Private

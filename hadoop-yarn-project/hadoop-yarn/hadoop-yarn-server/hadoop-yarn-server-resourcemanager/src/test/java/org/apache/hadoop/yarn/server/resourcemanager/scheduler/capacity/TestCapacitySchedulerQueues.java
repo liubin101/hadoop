@@ -161,6 +161,26 @@ public class TestCapacitySchedulerQueues {
   }
 
   @Test
+  public void testParallelRefreshQueues() throws Exception {
+    CapacityScheduler cs = new CapacityScheduler();
+    conf.setBoolean(CapacitySchedulerConfiguration.INITIALIZE_QUEUES_PARALLEL_ENABLE, true);
+    conf.setInt(CapacitySchedulerConfiguration.INITIALIZE_QUEUES_PARALLEL_MAXIMUM_THREAD, 10);
+    setupQueueConfiguration(conf);
+    cs.setConf(new YarnConfiguration());
+    cs.setRMContext(rm.getRMContext());
+    cs.init(conf);
+    cs.start();
+    cs.reinitialize(conf, rm.getRMContext());
+    checkQueueStructureCapacities(cs);
+
+    conf.setCapacity(A, 80f);
+    conf.setCapacity(B, 20f);
+    cs.reinitialize(conf, rm.getRMContext());
+    checkQueueStructureCapacities(cs, getDefaultCapacities(80f / 100.0f, 20f / 100.0f));
+    cs.stop();
+  }
+
+  @Test
   public void testRefreshQueuesWithNewQueue() throws Exception {
     CapacityScheduler cs = new CapacityScheduler();
     cs.setConf(new YarnConfiguration());

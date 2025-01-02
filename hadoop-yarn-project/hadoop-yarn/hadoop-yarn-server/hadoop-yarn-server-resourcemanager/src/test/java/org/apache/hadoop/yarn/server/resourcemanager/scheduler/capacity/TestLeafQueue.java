@@ -3227,6 +3227,26 @@ public class TestLeafQueue {
   }
 
   @Test
+  public void testParallelInitializeQueues() throws Exception {
+
+    CSQueueStore serialQueues = new CSQueueStore();
+    CapacitySchedulerQueueManager.parseQueue(queueContext,
+        csConf, null, ROOT.getFullPath(), serialQueues, queues,
+        TestUtils.spyHook);
+
+    csConf.setBoolean(CapacitySchedulerConfiguration.INITIALIZE_QUEUES_PARALLEL_ENABLE, true);
+    csConf.setInt(CapacitySchedulerConfiguration.INITIALIZE_QUEUES_PARALLEL_MAXIMUM_THREAD, 10);
+
+    CSQueueStore parallelQueues = new CSQueueStore();
+    CapacitySchedulerQueueManager.parseQueue(queueContext,
+        csConf, null, ROOT.getFullPath(), parallelQueues, queues,
+        TestUtils.spyHook);
+
+    assertEquals(serialQueues.getFullNameQueues().keySet(),
+        parallelQueues.getFullNameQueues().keySet());
+  }
+
+  @Test
   public void testRackLocalityDelayScheduling() throws Exception {
 
     // Change parameter values for node locality and rack locality delay.

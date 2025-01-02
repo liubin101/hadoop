@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
@@ -196,7 +197,7 @@ public class QueueMetrics implements MetricsSource {
 
     this.parent = parent != null ? parent.getMetrics() : null;
     this.parentQueue = parent;
-    this.users = enableUserMetrics ? new HashMap<String, QueueMetrics>() : null;
+    this.users = enableUserMetrics ? new ConcurrentHashMap<String, QueueMetrics>() : null;
     this.enableUserMetrics = enableUserMetrics;
 
     metricsSystem = ms;
@@ -253,7 +254,7 @@ public class QueueMetrics implements MetricsSource {
    * Simple metrics cache to help prevent re-registrations.
    */
   private static final Map<String, QueueMetrics> QUEUE_METRICS =
-      new HashMap<String, QueueMetrics>();
+      new ConcurrentHashMap<String, QueueMetrics>();
 
   /**
    * Returns the metrics cache to help prevent re-registrations.

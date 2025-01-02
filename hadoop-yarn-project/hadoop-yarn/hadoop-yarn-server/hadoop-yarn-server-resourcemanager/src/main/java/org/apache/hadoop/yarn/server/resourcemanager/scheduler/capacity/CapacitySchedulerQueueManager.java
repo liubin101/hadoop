@@ -19,12 +19,15 @@
 package org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveTask;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.yarn.security.PrivilegedEntity;
@@ -237,6 +240,40 @@ public class CapacitySchedulerQueueManager implements SchedulerQueueManager<
       CSQueue parent, String queueName, CSQueueStore newQueues, CSQueueStore oldQueues,
       QueueHook hook) throws IOException {
     CSQueue queue;
+    boolean initializeQueuesParallel = conf.getBoolean(
+        CapacitySchedulerConfiguration.INITIALIZE_QUEUES_PARALLEL_ENABLE,
+        CapacitySchedulerConfiguration.DEFAULT_INITIALIZE_QUEUES_PARALLEL_ENABLE
+    );
+
+    if (initializeQueuesParallel) {
+      LOG.info("Initialize queues in parallel");
+      queue = parallelParseQueue(queueContext, conf, parent, queueName,
+          newQueues, oldQueues, hook);
+    } else {
+      LOG.info("Initialize queues serially");
+      queue = serialParseQueue(queueContext, conf, parent, queueName,
+          newQueues, oldQueues, hook);
+    }
+    return queue;
+  }
+
+  /**
+   * Parse the queue from the configuration serially.
+   * @param queueContext the CapacitySchedulerQueueContext
+   * @param conf the CapacitySchedulerConfiguration
+   * @param parent the parent queue
+   * @param queueName the queue name
+   * @param newQueues all the queues
+   * @param oldQueues the old queues
+   * @param hook the queue hook
+   * @return the CSQueue
+   * @throws IOException
+   */
+  static CSQueue serialParseQueue(
+      CapacitySchedulerQueueContext queueContext, CapacitySchedulerConfiguration conf,
+      CSQueue parent, String queueName, CSQueueStore newQueues, CSQueueStore oldQueues,
+      QueueHook hook) throws IOException {
+    CSQueue queue;
     QueuePath queueToParse = (parent == null) ? new QueuePath(queueName) :
         (QueuePath.createFromQueues(parent.getQueuePath(), queueName));
     List<String> childQueueNames = conf.getQueues(queueToParse);
@@ -283,7 +320,7 @@ public class CapacitySchedulerQueueManager implements SchedulerQueueManager<
       queue = hook.hook(parentQueue);
       List<CSQueue> childQueues = new ArrayList<>();
       for (String childQueueName : childQueueNames) {
-        CSQueue childQueue = parseQueue(queueContext, conf, queue, childQueueName, newQueues,
+        CSQueue childQueue = serialParseQueue(queueContext, conf, queue, childQueueName, newQueues,
             oldQueues, hook);
         childQueues.add(childQueue);
       }
@@ -297,6 +334,45 @@ public class CapacitySchedulerQueueManager implements SchedulerQueueManager<
     newQueues.add(queue);
 
     LOG.info("Initialized queue: " + queueToParse.getFullPath());
+    return queue;
+  }
+
+  /**
+   * Parse the queue from the configuration in parallel.
+   * @param queueContext the CapacitySchedulerQueueContext
+   * @param conf the CapacitySchedulerConfiguration
+   * @param parent the parent queue
+   * @param queueName the queue name
+   * @param newQueues all the queues
+   * @param oldQueues the old queues
+   * @param hook the queue hook
+   * @return the CSQueue
+   * @throws IOException
+   */
+  static CSQueue parallelParseQueue(
+      CapacitySchedulerQueueContext queueContext, CapacitySchedulerConfiguration conf,
+      CSQueue parent, String queueName, CSQueueStore newQueues, CSQueueStore oldQueues,
+      QueueHook hook) throws IOException {
+    CSQueue queue;
+    ForkJoinPool initializeQueuesThreadPool = null;
+    try {
+      int initializeQueuesParallelism = conf.getInt(
+          CapacitySchedulerConfiguration.INITIALIZE_QUEUES_PARALLEL_MAXIMUM_THREAD,
+          CapacitySchedulerConfiguration.DEFAULT_INITIALIZE_QUEUES_PARALLEL_MAXIMUM_THREAD);
+      initializeQueuesParallelism = Math.max(initializeQueuesParallelism, 1);
+
+      initializeQueuesThreadPool = new ForkJoinPool(initializeQueuesParallelism);
+      ParseQueueTask parseQueueTask = new ParseQueueTask(queueContext, conf, parent,
+          queueName, newQueues, oldQueues, hook);
+
+      queue = initializeQueuesThreadPool.invoke(parseQueueTask);
+    } catch (RuntimeException e) {
+      throw new IOException("Exception occurred during parse queue", e);
+    } finally {
+      if (initializeQueuesThreadPool != null) {
+        initializeQueuesThreadPool.shutdownNow();
+      }
+    }
     return queue;
   }
 
@@ -740,6 +816,106 @@ public class CapacitySchedulerQueueManager implements SchedulerQueueManager<
     if (parent == null) {
       throw new IllegalStateException("Queue configuration missing child queue names for "
           + queueName);
+    }
+  }
+
+  static class ParseQueueTask extends RecursiveTask<CSQueue> implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private transient CapacitySchedulerQueueContext queueContext;
+    private transient CapacitySchedulerConfiguration conf;
+    private transient CSQueue parent;
+    private String queueName;
+    private transient CSQueueStore newQueues;
+    private transient CSQueueStore oldQueues;
+    private transient QueueHook hook;
+
+    ParseQueueTask(
+        CapacitySchedulerQueueContext queueContext, CapacitySchedulerConfiguration conf,
+        CSQueue parent, String queueName, CSQueueStore newQueues, CSQueueStore oldQueues,
+        QueueHook hook) {
+      this.queueContext = queueContext;
+      this.conf = conf;
+      this.parent = parent;
+      this.queueName = queueName;
+      this.newQueues = newQueues;
+      this.oldQueues = oldQueues;
+      this.hook = hook;
+    }
+
+    @Override
+    protected CSQueue compute() {
+      CSQueue queue;
+      try {
+        QueuePath queueToParse = (parent == null) ? new QueuePath(queueName) :
+            (QueuePath.createFromQueues(parent.getQueuePath(), queueName));
+        List<String> childQueueNames = conf.getQueues(queueToParse);
+        CSQueue oldQueue = oldQueues.get(queueToParse.getFullPath());
+
+        boolean isReservableQueue = conf.isReservable(queueToParse);
+        boolean isAutoCreateEnabled = conf.isAutoCreateChildQueueEnabled(queueToParse);
+        // if a queue is eligible for auto queue creation v2 it must be a ParentQueue
+        // (even if it is empty)
+        final boolean isDynamicParent = oldQueue instanceof AbstractParentQueue &&
+            oldQueue.isDynamicQueue();
+        boolean isAutoQueueCreationEnabledParent = isDynamicParent || conf.isAutoQueueCreationV2Enabled(
+            queueToParse) || isAutoCreateEnabled;
+
+        if (childQueueNames.size() == 0 && !isAutoQueueCreationEnabledParent) {
+          validateParent(parent, queueName);
+          // Check if the queue will be dynamically managed by the Reservation system
+          if (isReservableQueue) {
+            queue = new PlanQueue(queueContext, queueName, parent,
+                oldQueues.get(queueToParse.getFullPath()));
+            ReservationQueue defaultResQueue = ((PlanQueue) queue).initializeDefaultInternalQueue();
+            newQueues.add(defaultResQueue);
+          } else {
+            queue = new LeafQueue(queueContext, queueName, parent,
+                oldQueues.get(queueToParse.getFullPath()));
+          }
+
+          queue = hook.hook(queue);
+        } else {
+          if (isReservableQueue) {
+            throw new IllegalStateException("Only Leaf Queues can be reservable for " +
+                queueToParse.getFullPath());
+          }
+
+          AbstractParentQueue parentQueue;
+          if (isAutoCreateEnabled) {
+            parentQueue = new ManagedParentQueue(queueContext, queueName, parent, oldQueues.get(
+                queueToParse.getFullPath()));
+          } else {
+            parentQueue = new ParentQueue(queueContext, queueName, parent, oldQueues.get(
+                queueToParse.getFullPath()));
+          }
+
+          queue = hook.hook(parentQueue);
+          List<ParseQueueTask> parseQueueTasks = new ArrayList<>();
+          List<CSQueue> childQueues = new ArrayList<>();
+          for (String childQueueName : childQueueNames) {
+            ParseQueueTask parseQueueTask = new ParseQueueTask(queueContext, conf, queue,
+                childQueueName, newQueues, oldQueues, hook);
+            parseQueueTask.fork();
+            parseQueueTasks.add(parseQueueTask);
+          }
+
+          for (ParseQueueTask parseQueueTask : parseQueueTasks) {
+            childQueues.add(parseQueueTask.join());
+          }
+          if (!childQueues.isEmpty()) {
+            parentQueue.setChildQueues(childQueues);
+          }
+
+        }
+
+        newQueues.add(queue);
+
+        LOG.info("Initialized queue: " + queueToParse.getFullPath());
+      } catch (IOException e) {
+        throw new RuntimeException("Exception occurred during parse queue", e);
+      }
+      return queue;
     }
   }
 }

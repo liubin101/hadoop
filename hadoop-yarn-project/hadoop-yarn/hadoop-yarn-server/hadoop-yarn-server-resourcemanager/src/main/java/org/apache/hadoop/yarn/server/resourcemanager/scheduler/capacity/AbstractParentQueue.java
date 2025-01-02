@@ -26,6 +26,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 
@@ -40,6 +42,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authorize.AccessControlList;
+import org.apache.hadoop.util.concurrent.HadoopExecutors;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ContainerStatus;
@@ -557,6 +560,7 @@ public abstract class AbstractParentQueue extends AbstractCSQueue {
   public void reinitialize(CSQueue newlyParsedQueue,
         Resource clusterResource) throws IOException {
     writeLock.lock();
+    ExecutorService executor = null;
     try {
       // We skip reinitialize for dynamic queues, when this is called, and
       // new queue is different from this queue, we will make this queue to be
@@ -572,6 +576,12 @@ public abstract class AbstractParentQueue extends AbstractCSQueue {
             "Trying to reinitialize " + getQueuePath() + " from "
                 + newlyParsedQueue.getQueuePath());
       }
+
+      CapacitySchedulerConfiguration conf = queueContext.getConfiguration();
+      boolean initializeQueuesParallel = conf.getBoolean(
+          CapacitySchedulerConfiguration.INITIALIZE_QUEUES_PARALLEL_ENABLE,
+          CapacitySchedulerConfiguration.DEFAULT_INITIALIZE_QUEUES_PARALLEL_ENABLE
+      );
 
       AbstractParentQueue newlyParsedParentQueue = (AbstractParentQueue) newlyParsedQueue;
 
@@ -595,46 +605,35 @@ public abstract class AbstractParentQueue extends AbstractCSQueue {
         }
       }
 
-      for (Map.Entry<String, CSQueue> e : newChildQueues.entrySet()) {
-        String newChildQueueName = e.getKey();
-        CSQueue newChildQueue = e.getValue();
+      if (initializeQueuesParallel) {
+        LOG.info("Reinitialize queues in parallel");
+        int initializeQueuesParallelism = conf.getInt(
+            CapacitySchedulerConfiguration.INITIALIZE_QUEUES_PARALLEL_MAXIMUM_THREAD,
+            CapacitySchedulerConfiguration.DEFAULT_INITIALIZE_QUEUES_PARALLEL_MAXIMUM_THREAD);
+        initializeQueuesParallelism = Math.max(initializeQueuesParallelism, 1);
 
-        CSQueue childQueue = currentChildQueues.get(newChildQueueName);
-
-        // Check if the child-queue already exists
-        if (childQueue != null) {
-          // Check if the child-queue has been converted into parent queue or
-          // parent Queue has been converted to child queue. The CS has already
-          // checked to ensure that this child-queue is in STOPPED state if
-          // Child queue has been converted to ParentQueue.
-          if ((childQueue instanceof AbstractLeafQueue
-              && newChildQueue instanceof AbstractParentQueue)
-              || (childQueue instanceof AbstractParentQueue
-                  && newChildQueue instanceof AbstractLeafQueue)) {
-            // We would convert this LeafQueue to ParentQueue, or vice versa.
-            // consider this as the combination of DELETE then ADD.
-            newChildQueue.setParent(this);
-            currentChildQueues.put(newChildQueueName, newChildQueue);
-            // inform CapacitySchedulerQueueManager
-            CapacitySchedulerQueueManager queueManager =
-                queueContext.getQueueManager();
-            queueManager.addQueue(newChildQueueName, newChildQueue);
-            continue;
-          }
-          // Re-init existing queues
-          childQueue.reinitialize(newChildQueue, clusterResource);
-          LOG.info(getQueuePath() + ": re-configured queue: " + childQueue);
-        } else{
-          // New child queue, do not re-init
-
-          // Set parent to 'this'
-          newChildQueue.setParent(this);
-
-          // Save in list of current child queues
-          currentChildQueues.put(newChildQueueName, newChildQueue);
-
-          LOG.info(
-              getQueuePath() + ": added new child queue: " + newChildQueue);
+        executor = HadoopExecutors.newFixedThreadPool(initializeQueuesParallelism);
+        CountDownLatch allDone = new CountDownLatch(newChildQueues.size());
+        for (Map.Entry<String, CSQueue> e : newChildQueues.entrySet()) {
+          executor.submit(() -> {
+            try {
+              reinitializeChildQueues(e, currentChildQueues, clusterResource);
+            } catch (IOException ex) {
+              throw new RuntimeException(ex);
+            } finally {
+              allDone.countDown();
+            }
+          });
+        }
+        try {
+          allDone.await();
+        } catch (InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      } else {
+        LOG.info("Reinitialize queues serially");
+        for (Map.Entry<String, CSQueue> e : newChildQueues.entrySet()) {
+          reinitializeChildQueues(e, currentChildQueues, clusterResource);
         }
       }
 
@@ -658,7 +657,55 @@ public abstract class AbstractParentQueue extends AbstractCSQueue {
       // Make sure we notifies QueueOrderingPolicy
       queueOrderingPolicy.setQueues(childQueues);
     } finally {
+      if (executor != null) {
+        executor.shutdownNow();
+      }
       writeLock.unlock();
+    }
+  }
+
+  private void reinitializeChildQueues(Map.Entry<String, CSQueue> e,
+      Map<String, CSQueue> currentChildQueues,
+      Resource clusterResource) throws IOException {
+    String newChildQueueName = e.getKey();
+    CSQueue newChildQueue = e.getValue();
+
+    CSQueue childQueue = currentChildQueues.get(newChildQueueName);
+
+    // Check if the child-queue already exists
+    if (childQueue != null) {
+      // Check if the child-queue has been converted into parent queue or
+      // parent Queue has been converted to child queue. The CS has already
+      // checked to ensure that this child-queue is in STOPPED state if
+      // Child queue has been converted to ParentQueue.
+      if ((childQueue instanceof AbstractLeafQueue
+          && newChildQueue instanceof AbstractParentQueue)
+          || (childQueue instanceof AbstractParentQueue
+              && newChildQueue instanceof AbstractLeafQueue)) {
+        // We would convert this LeafQueue to ParentQueue, or vice versa.
+        // consider this as the combination of DELETE then ADD.
+        newChildQueue.setParent(this);
+        currentChildQueues.put(newChildQueueName, newChildQueue);
+        // inform CapacitySchedulerQueueManager
+        CapacitySchedulerQueueManager queueManager =
+            queueContext.getQueueManager();
+        queueManager.addQueue(newChildQueueName, newChildQueue);
+        return;
+      }
+      // Re-init existing queues
+      childQueue.reinitialize(newChildQueue, clusterResource);
+      LOG.info(getQueuePath() + ": re-configured queue: " + childQueue);
+    } else {
+      // New child queue, do not re-init
+
+      // Set parent to 'this'
+      newChildQueue.setParent(this);
+
+      // Save in list of current child queues
+      currentChildQueues.put(newChildQueueName, newChildQueue);
+
+      LOG.info(
+          getQueuePath() + ": added new child queue: " + newChildQueue);
     }
   }
 
